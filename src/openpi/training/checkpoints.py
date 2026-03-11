@@ -20,7 +20,8 @@ import openpi.training.utils as training_utils
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
 ) -> tuple[ocp.CheckpointManager, bool]:
-    checkpoint_dir = epath.Path(checkpoint_dir).resolve()
+    # checkpoint_dir = epath.Path(checkpoint_dir).resolve()
+    checkpoint_dir = epath.Path("/home_local/gier_vl/.cache/openpi/checkpoints/").resolve()
     resuming = False
     if checkpoint_dir.exists():
         if overwrite:
