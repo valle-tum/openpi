@@ -1,6 +1,7 @@
 """See _CONFIGS for the list of available configs."""
 
 import abc
+import math
 from collections.abc import Sequence
 import dataclasses
 import difflib
@@ -10,6 +11,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from typing_extensions import override
 import tyro
 
@@ -20,6 +22,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.lwr_policy as lwr_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -223,6 +226,104 @@ class SimpleDataConfig(DataConfigFactory):
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLWRDataConfig(DataConfigFactory):
+    """
+    DataConfigFactory for your LeRobot v3 dataset.
+
+    Your dataset raw keys:
+      - observation.static_cam.rgb   (HWC float [0,1])
+      - observation.wrist_cam.rgb    (HWC float [0,1])
+      - observation.state            (8,)
+      - actions                      (8,)
+      - task (optional, if prompt_from_task=True)
+    """
+
+    base_config: DataConfig = DataConfig(prompt_from_task=True)
+    # base_config.action_sequence_keys = action_sequence_keys=("action",)
+    train_frac: float = 0.9
+
+    # Needed so the masking behavior matches pi0-fast vs others
+    model_type: _model.ModelType = _model.ModelType.PI05  # <-- adjust enum name if different in your repo
+
+    def _compute_splits(self) -> tuple[list[int], list[int]]:
+        meta = LeRobotDatasetMetadata(self.repo_id)
+        num_episodes = meta.total_episodes
+        num_train = math.floor(num_episodes * self.train_frac)
+        return list(range(num_train)), list(range(num_train, num_episodes))
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig, use_eval: bool=False) -> DataConfig:
+        # 1) Repack: map from LeRobot v3 keys to what LeRobotLWRInputs expects.
+        # Our LeRobotLWRInputs expects:
+        #   observation.static_cam.rgb
+        #   observation.wrist_cam.rgb
+        #   observation.state
+        #   action
+        repack_transforms = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.static_cam.rgb": "observation.static_cam.rgb",
+                        "observation.wrist_cam.rgb": "observation.wrist_cam.rgb",
+                        "state": "observation.state",
+                        "actions": "actions",
+                        # If your dataset includes "prompt" already, map it here.
+                        # Otherwise, prompt_from_task=True will generate it from "task".
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        # 2) Your custom policy transforms (images + normalization + padding)
+        data_transforms = _transforms.Group(
+            inputs=[
+                lwr_policy.LeRobotLWRInputs(
+                    model_type=model_config.model_type,
+                    adapt_to_pi=True,
+                    out_hw=(224, 224),
+                )
+            ],
+            outputs=[lwr_policy.LeRobotLWROutputs(adapt_to_pi=True)],
+        )
+
+        # 3) Optional but common: absolute<->delta actions conversion
+        # If your "action" is absolute joint targets, and you want delta training:
+        # - mask first 7 dims (joints) as delta
+        # - keep gripper (last dim) absolute
+        #
+        # If your actions are ALREADY deltas, skip this entire block.
+        delta_action_mask = _transforms.make_bool_mask(7, -1)  # 7 joints as delta, last dim (gripper) False
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # 4) Model transforms (tokenize prompt, action targets, etc.)
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # 5) Compute dataset split
+        if use_eval:
+            _, episodes = self._compute_splits()
+        else:
+            episodes, _ = self._compute_splits()
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # episodes=episodes,
+        )
+
+    def create_eval_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        """Returns the same DataConfig but restricted to val episodes."""
+        # Reuse create() output and just swap the episode list
+        train_config = self.create(assets_dirs, model_config, use_eval=True)
+        return train_config
 
 
 @dataclasses.dataclass(frozen=True)
@@ -558,6 +659,36 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    #
+    # Inference Config LWR
+    #
+    TrainConfig(
+        name="pi05_lwr",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            # action_dim=8,
+            ),
+        data=LeRobotLWRDataConfig(
+            repo_id="lwr_v2_train",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/gier_vl/.cache/openpi/openpi-assets/pytorch/",
+        num_train_steps=30_000,
+        log_interval=100,
+        save_interval=15_000,
+    ),
     #
     # Inference Aloha configs.
     #
