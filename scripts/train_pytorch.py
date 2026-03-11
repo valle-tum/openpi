@@ -22,6 +22,7 @@ Multi-Node Training:
     scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
 
 """
+from etils import epath
 
 import dataclasses
 import gc
@@ -151,11 +152,12 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
     if not is_main:
         return
 
+    checkpoint_dir = epath.Path("/home_local/gier_vl/.cache/openpi/checkpoints/")
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
         # Create temporary directory for atomic checkpoint saving
-        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+        final_ckpt_dir = checkpoint_dir / f"{global_step}"
+        tmp_ckpt_dir = checkpoint_dir / f"tmp_{global_step}"
 
         # Remove any existing temp directory and create new one
         if tmp_ckpt_dir.exists():
